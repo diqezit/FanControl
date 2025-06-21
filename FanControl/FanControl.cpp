@@ -1,264 +1,279 @@
+// A background application to force a Lenovo laptop's fan to its highest speed.
+// It runs in the system tray and restores normal fan speed upon exit.
+// Requires Lenovo Energy/ACPI driver.
+
 #include <Windows.h>
-#include <Winuser.h>
-#include <Ioapiset.h>
 #include <winioctl.h>
-#include <cstdlib>
-#include <cstdio>
-#include <Tchar.h>
+#include <shellapi.h>
+#include "resource.h"
 
-DWORD write_fast() {
-	HANDLE hndl = CreateFileW(L"\\\\.\\EnergyDrv", 0xC0000000, 0, 0i64, 2u, 0x80u, 0i64);
-	if (hndl == (HANDLE)-1i64) {
-		printf("Failed open %s", "\\\\.\\EnergyDrv");
-		return -1;
-	}
+//================================================================================
+// 1. Application-level Globals & Constants
+//================================================================================
+constexpr WCHAR APP_WINDOW_CLASS[] = L"__FanControlHiddenWindow";
+constexpr WCHAR APP_MUTEX_NAME[] = L"Global\\FanControlSingletonMutex";
+constexpr UINT  WM_TRAY_ICON_MSG = WM_APP + 1;
 
-	// lpInBuffer value: 06 00 00 00  01 00 00 00  01 00 00 00 ~ [ 6, 1, 1 ] (inv endian)
-	DWORD in[3];
-	in[0] = 6;
-	in[1] = 1;
-	in[2] = 1;
-		
-	DWORD v16 = 0;
+HANDLE g_hMutex = NULL;
 
-	DeviceIoControl(hndl, 0x831020C0, in, 12u, NULL, 0, &v16, 0);
-	CloseHandle(hndl);
+//================================================================================
+// 2. Fan Control Interface (High-Level API)
+//================================================================================
+enum class FanMode {
+    Unknown,
+    Normal,
+    Fast
+};
 
-	return 0;
+bool SetFanMode(FanMode mode);
+FanMode GetFanMode();
+
+//================================================================================
+// 3. Fan Control Implementation (Low-Level Driver Communication)
+//================================================================================
+namespace FanControllerImpl {
+    constexpr WCHAR DRIVER_PATH[] = L"\\\\.\\EnergyDrv";
+
+    // IOCTL codes for Lenovo's Energy Management driver.
+    constexpr DWORD IOCTL_WRITE_MODE = 0x831020C0;
+    constexpr DWORD IOCTL_READ_STATE = 0x831020C4;
+
+    // Driver's return value for the normal/automatic fan state.
+    constexpr DWORD DRIVER_STATE_VALUE_FOR_NORMAL = 3;
 }
 
-DWORD write_normal() {
-	HANDLE hndl = CreateFileW(L"\\\\.\\EnergyDrv", 0xC0000000, 0, 0i64, 2u, 0x80u, 0i64);
-	if (hndl == (HANDLE)-1i64) {
-		printf("Failed open %s", "\\\\.\\EnergyDrv");
-		return -1;
-	}
+bool SetFanMode(FanMode mode) {
+    if (mode == FanMode::Unknown) {
+        return false;
+    }
 
-	// lpInBuffer value: 06 00 00 00  01 00 00 00  00 00 00 00 ~ [ 6, 1, 1 ] (inv endian)
-	DWORD in[3];
-	in[0] = 6;
-	in[1] = 1;
-	in[2] = 0;
-		
-	DWORD v16 = 0;
+    HANDLE hDriver = CreateFileW(
+        FanControllerImpl::DRIVER_PATH,
+        GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
 
-	DeviceIoControl(hndl, 0x831020C0, in, 12u, NULL, 0, &v16, 0);
-	CloseHandle(hndl);
+    if (hDriver == INVALID_HANDLE_VALUE) {
+        return false;
+    }
 
-	return 0;
+    // The driver expects a 12-byte buffer: {6, 1, mode_flag}.
+    // mode_flag: 0 for Normal/Auto, 1 for Fast/Dust-Cleaning.
+    DWORD inBuffer[3] = { 6, 1, (mode == FanMode::Fast) ? 1UL : 0UL };
+
+    BOOL result = DeviceIoControl(
+        hDriver,
+        FanControllerImpl::IOCTL_WRITE_MODE,
+        inBuffer,
+        sizeof(inBuffer),
+        NULL,
+        0,
+        NULL,
+        NULL
+    );
+
+    CloseHandle(hDriver);
+    return result;
 }
 
-DWORD read_state() {
-	HANDLE hndl = CreateFileW(L"\\\\.\\EnergyDrv", 0xC0000000, 0, 0i64, 2u, 0x80u, 0i64);
-	if (hndl == (HANDLE)-1i64) {
-		printf("Failed open %s", "\\\\.\\EnergyDrv");
-		return -1;
-	}
-		
-	// lpInBuffer value: 0E 00 00 00 ~ [ 14 ] (inv endian)
-	DWORD in = 14;
-		
-	DWORD out;
-		
-	DWORD v16 = 0;
+FanMode GetFanMode() {
+    HANDLE hDriver = CreateFileW(
+        FanControllerImpl::DRIVER_PATH,
+        GENERIC_READ,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
 
-	DeviceIoControl(hndl, 0x831020C4, &in, 4u, &out, 4u, &v16, 0);
-	CloseHandle(hndl);
+    if (hDriver == INVALID_HANDLE_VALUE) {
+        return FanMode::Unknown;
+    }
 
-	return out;
+    DWORD inBuffer = 14;
+    DWORD outBuffer = 0;
+    DWORD bytesReturned = 0;
+
+    BOOL result = DeviceIoControl(
+        hDriver,
+        FanControllerImpl::IOCTL_READ_STATE,
+        &inBuffer,
+        sizeof(inBuffer),
+        &outBuffer,
+        sizeof(outBuffer),
+        &bytesReturned,
+        NULL
+    );
+
+    CloseHandle(hDriver);
+
+    if (!result || bytesReturned != sizeof(outBuffer)) {
+        return FanMode::Unknown;
+    }
+
+    return (outBuffer == FanControllerImpl::DRIVER_STATE_VALUE_FOR_NORMAL) ? FanMode::Normal : FanMode::Fast;
 }
 
-// Used to send "normal" speed state to fan on program exit
-void exit_handler() {
-	write_normal();
+//================================================================================
+// 4. Application Logic
+//================================================================================
+void RestoreNormalFanSpeedOnExit() {
+    for (int i = 0; i < 3; ++i) {
+        if (SetFanMode(FanMode::Normal) && GetFanMode() == FanMode::Normal) {
+            return;
+        }
+        Sleep(250);
+    }
+    SetFanMode(FanMode::Normal);
 }
 
-BOOL WINAPI ConsoleHandler(DWORD dwType) {
-	switch(dwType) {
-		case CTRL_C_EVENT:
-		case CTRL_BREAK_EVENT:
-		case CTRL_CLOSE_EVENT:
-		case CTRL_LOGOFF_EVENT:
-		case CTRL_SHUTDOWN_EVENT:
-
-			write_normal();
-
-			Sleep(1000);
-
-			// Sometimes it does not stop
-			write_normal();
-
-			Sleep(100);
-
-			ExitProcess(0);
-
-			return TRUE;
-		default:
-			break;
-	}
-	return FALSE;
+void Cleanup() {
+    if (g_hMutex) {
+        ReleaseMutex(g_hMutex);
+        CloseHandle(g_hMutex);
+    }
 }
 
-void print_help() {
-	printf("Use FanControl.exe \"help\" for help\n");
-	printf("Use FanControl.exe \"fast\" for 100%% speed\n");
-	printf("Use FanControl.exe \"normal\" for basic speed");
-	printf("Use FanControl.exe \"read\" for get CleanDustData (driver response code)\n");
-	printf("Use FanControl.exe \"holdfast\" \"[value]\" to automatically request 100%% speed when driver responds with code different from <value> (example: FanControl.exe holdfast 3)\n");
+bool InitializeTrayIcon(HWND hWnd, NOTIFYICONDATA* nid) {
+    memset(nid, 0, sizeof(*nid));
+    nid->cbSize = sizeof(*nid);
+    nid->hWnd = hWnd;
+    nid->uID = 0;
+    nid->uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid->uCallbackMessage = WM_TRAY_ICON_MSG;
+
+    HICON hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_ICON1));
+    nid->hIcon = (hIcon) ? hIcon : LoadIcon(nullptr, IDI_APPLICATION);
+
+    lstrcpy(nid->szTip, L"FanControl (RMB to Exit)");
+
+    return Shell_NotifyIcon(NIM_ADD, nid);
 }
 
-// https://stackoverflow.com/questions/38971064/c-event-handling-for-click-on-notification-area-icon-windows
-LRESULT CALLBACK WndProc(HWND hWnd, UINT iMsg, WPARAM wParam, LPARAM lParam)
-{
+LRESULT CALLBACK WndProc(
+    HWND hWnd,
+    UINT iMsg,
+    WPARAM wParam,
+    LPARAM lParam
+) {
     static NOTIFYICONDATA nid;
 
-    switch (iMsg)
-    {
-        case WM_CREATE:
-            memset(&nid, 0, sizeof(nid));
-            nid.cbSize = sizeof(nid);
-            nid.hWnd = hWnd;
-            nid.uID = 0;
-            nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-            nid.uCallbackMessage = WM_APP + 1;
-            nid.hIcon = LoadIcon(nullptr, IDI_WARNING);
-			lstrcpy(nid.szTip, (LPTSTR) L"FanControl (right click to exit)");
-            Shell_NotifyIcon(NIM_ADD, &nid);
-            Shell_NotifyIcon(NIM_SETVERSION, &nid);
-            return 0;
-        case WM_APP + 1:
-            switch (lParam) {
-                case WM_RBUTTONUP:
-					PostQuitMessage(0);
-                    break;
-            }
-            break;
-        case WM_DESTROY:
-            Shell_NotifyIcon(NIM_DELETE, &nid);
+    switch (iMsg) {
+    case WM_CREATE:
+        if (!InitializeTrayIcon(hWnd, &nid)) {
+            MessageBox(NULL, L"Could not create tray icon.", L"Error", MB_OK | MB_ICONERROR);
+            PostQuitMessage(1);
+        }
+        return 0;
+    case WM_TRAY_ICON_MSG:
+        if (lParam == WM_RBUTTONUP) {
             PostQuitMessage(0);
-            return 0;
+        }
+        return 0;
+    case WM_DESTROY:
+        Shell_NotifyIcon(NIM_DELETE, &nid);
+        if (nid.hIcon) DestroyIcon(nid.hIcon);
+        PostQuitMessage(0);
+        return 0;
     }
-    return DefWindowProc(hWnd,iMsg,wParam,lParam);
+    return DefWindowProc(hWnd, iMsg, wParam, lParam);
 }
 
-int main(int argc, const char** argv) {
+void ProcessFanLogic() {
+    // Periodically re-assert fast mode in case it was reset by the system.
+    if (GetFanMode() == FanMode::Normal) {
+        if (!SetFanMode(FanMode::Fast)) {
+            PostQuitMessage(1);
+        }
+    }
+}
 
-	if (argc == 1) {
+void RunMainLoop() {
+    if (!SetFanMode(FanMode::Fast)) {
+        MessageBox(NULL, L"Could not set initial fan speed. Is the driver installed?", L"Error", MB_OK | MB_ICONERROR);
+        PostQuitMessage(1);
+        return;
+    }
 
-		// Hide console, show tray icon with right click exit
-		::ShowWindow(::GetConsoleWindow(), SW_HIDE);
+    bool keepRunning = true;
+    while (keepRunning) {
+        DWORD waitResult = MsgWaitForMultipleObjects(
+            0,
+            NULL,
+            FALSE,
+            2000,
+            QS_ALLINPUT
+        );
 
-		LPCWSTR lpszClass = L"__hidden__";
+        if (waitResult == WAIT_OBJECT_0) {
+            MSG msg;
+            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) {
+                    keepRunning = false;
+                    break;
+                }
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+        }
+        else if (waitResult == WAIT_TIMEOUT) {
+            ProcessFanLogic();
+        }
+    }
+}
 
-		HINSTANCE hInstance = GetModuleHandle(nullptr);
+bool InitializeApplication(HINSTANCE hInstance) {
+    g_hMutex = CreateMutex(NULL, TRUE, APP_MUTEX_NAME);
+    if (g_hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBox(NULL, L"Another instance of FanControl is already running.", L"Error", MB_OK | MB_ICONERROR);
+        if (g_hMutex) CloseHandle(g_hMutex);
+        return false;
+    }
 
-		WNDCLASS wc;
-		HWND hWnd;
-		MSG msg;
+    WNDCLASS wc = {};
+    wc.hInstance = hInstance;
+    wc.lpfnWndProc = WndProc;
+    wc.lpszClassName = APP_WINDOW_CLASS;
+    if (!RegisterClass(&wc)) return false;
 
-		wc.cbClsExtra = 0;
-		wc.cbWndExtra = 0;
-		wc.hbrBackground = nullptr;
-		wc.hCursor = nullptr;
-		wc.hIcon = nullptr;
-		wc.hInstance = hInstance;
-		wc.lpfnWndProc = WndProc;
-		wc.lpszClassName = lpszClass;
-		wc.lpszMenuName = nullptr;
-		wc.style = 0;
-		RegisterClass(&wc);
+    HWND hWnd = CreateWindow(
+        APP_WINDOW_CLASS,
+        L"FanControl Hidden Window",
+        0, 0, 0, 0, 0,
+        NULL, NULL, hInstance, NULL
+    );
+    return hWnd != NULL;
+}
 
-		hWnd = CreateWindow(lpszClass, lpszClass, WS_OVERLAPPEDWINDOW,
-			CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-			nullptr, nullptr, hInstance, nullptr);
+//================================================================================
+// 5. Main Entry Point
+//================================================================================
+int WINAPI WinMain(
+    _In_ HINSTANCE hInstance,
+    _In_opt_ HINSTANCE hPrevInstance,
+    _In_ LPSTR lpCmdLine,
+    _In_ int nCmdShow
+) {
+    UNREFERENCED_PARAMETER(hPrevInstance);
+    UNREFERENCED_PARAMETER(lpCmdLine);
+    UNREFERENCED_PARAMETER(nCmdShow);
 
-		// Hardcoded from my driver version
-		int expected_value = 3;
+    if (!InitializeApplication(hInstance)) {
+        return 1;
+    }
 
-		std::atexit(exit_handler);
-		SetConsoleCtrlHandler(ConsoleHandler, true);
+    __try {
+        RunMainLoop();
+    }
+    __finally {
+        RestoreNormalFanSpeedOnExit();
+        Cleanup();
+    }
 
-		while (true) {
-			int state = read_state();
-
-			if (state == -1)
-				return 0;
-
-			if (state != expected_value) 
-				if (write_fast() == -1)
-					return 0;
-			
-			while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-				TranslateMessage(&msg);
-				DispatchMessage(&msg);
-			}
-
-			if (msg.message == WM_QUIT) {
-
-				write_normal();
-
-				Sleep(1000);
-
-				// Sometimes it does not stop
-				write_normal();
-
-				Sleep(100);
-
-				ExitProcess(0);
-			}
-			
-			// Sleep for 2 seconds because fan slowdown timeout window is 2 seconds
-			Sleep(2000);
-		}
-
-		return static_cast<int>(msg.wParam);
-		
-	} else if (strcmp(argv[1], "help") == 0) {
-
-		print_help();
-
-	} else if (strcmp(argv[1], "fast") == 0) {
-
-		write_fast();
-
-	} else if (strcmp(argv[1], "normal") == 0) {
-
-		write_normal();
-
-	} else if (strcmp(argv[1], "read") == 0) {
-
-		printf("CleanDustData: %d", read_state());
-
-	} else if (strcmp(argv[1], "holdfast") == 0) {
-
-		// Hardcoded from my driver version
-		int expected_value = 3;
-		
-		if (argc > 2)
-			expected_value = atoi(argv[2]);
-
-		std::atexit(exit_handler);
-		SetConsoleCtrlHandler(ConsoleHandler, true);
-
-		while (true) {
-			int state = read_state();
-
-			if (state == -1)
-				return 0;
-
-			if (state != expected_value) 
-				if (write_fast() == -1)
-					return 0;
-			
-			// Sleep for 2 seconds because fan slowdown timeout window is 2 seconds
-			Sleep(2000);
-		}
-
-	} else {
-		
-		print_help();
-
-	}
-
-	return 0;
+    return 0;
 }
