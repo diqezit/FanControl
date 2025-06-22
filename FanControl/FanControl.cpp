@@ -5,6 +5,7 @@
 #include <Windows.h>
 #include <winioctl.h>
 #include <shellapi.h>
+#include <memory>
 #include "resource.h"
 
 //================================================================================
@@ -16,126 +17,124 @@ constexpr UINT  WM_TRAY_ICON_MSG = WM_APP + 1;
 
 HANDLE g_hMutex = NULL;
 
-//================================================================================
-// 2. Fan Control Interface (High-Level API)
-//================================================================================
 enum class FanMode {
     Unknown,
     Normal,
     Fast
 };
 
-bool SetFanMode(FanMode mode);
-FanMode GetFanMode();
-
 //================================================================================
-// 3. Fan Control Implementation (Low-Level Driver Communication)
+// 2. Fan Driver Abstraction Class (SRP, DRY, RAII)
 //================================================================================
-namespace FanControllerImpl {
-    constexpr WCHAR DRIVER_PATH[] = L"\\\\.\\EnergyDrv";
+class FanDriver
+{
+public:
+    FanDriver() : m_hDriver(INVALID_HANDLE_VALUE)
+    {
+        m_hDriver = CreateFileW(
+            DRIVER_PATH,
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        );
+    }
 
+    ~FanDriver()
+    {
+        if (m_hDriver != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(m_hDriver);
+        }
+    }
+
+    bool IsInitialized() const
+    {
+        return m_hDriver != INVALID_HANDLE_VALUE;
+    }
+
+    bool SetMode(FanMode mode)
+    {
+        if (!IsInitialized() || mode == FanMode::Unknown) {
+            return false;
+        }
+
+        DWORD inBuffer[3] = { 6, 1, (mode == FanMode::Fast) ? 1UL : 0UL };
+
+        return DeviceIoControl(
+            m_hDriver,
+            IOCTL_WRITE_MODE,
+            inBuffer,
+            sizeof(inBuffer),
+            NULL,
+            0,
+            NULL,
+            NULL
+        ) != 0;
+    }
+
+    FanMode GetMode()
+    {
+        if (!IsInitialized()) {
+            return FanMode::Unknown;
+        }
+
+        DWORD inBuffer = 14;
+        DWORD outBuffer = 0;
+        DWORD bytesReturned = 0;
+
+        BOOL result = DeviceIoControl(
+            m_hDriver,
+            IOCTL_READ_STATE,
+            &inBuffer,
+            sizeof(inBuffer),
+            &outBuffer,
+            sizeof(outBuffer),
+            &bytesReturned,
+            NULL
+        );
+
+        if (!result || bytesReturned != sizeof(outBuffer)) {
+            return FanMode::Unknown;
+        }
+
+        return (outBuffer == DRIVER_STATE_VALUE_FOR_FAST) ? FanMode::Fast : FanMode::Normal;
+    }
+
+private:
     // IOCTL codes for Lenovo's Energy Management driver.
-    constexpr DWORD IOCTL_WRITE_MODE = 0x831020C0;
-    constexpr DWORD IOCTL_READ_STATE = 0x831020C4;
+    static constexpr WCHAR DRIVER_PATH[] = L"\\\\.\\EnergyDrv";
+    static constexpr DWORD IOCTL_WRITE_MODE = 0x831020C0;
+    static constexpr DWORD IOCTL_READ_STATE = 0x831020C4;
+    static constexpr DWORD DRIVER_STATE_VALUE_FOR_FAST = 3;
 
-    // Driver's return value for the normal/automatic fan state.
-    constexpr DWORD DRIVER_STATE_VALUE_FOR_NORMAL = 3;
-}
+    HANDLE m_hDriver;
+};
 
-bool SetFanMode(FanMode mode) {
-    if (mode == FanMode::Unknown) {
-        return false;
-    }
-
-    HANDLE hDriver = CreateFileW(
-        FanControllerImpl::DRIVER_PATH,
-        GENERIC_WRITE,
-        0,
-        NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL
-    );
-
-    if (hDriver == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    // The driver expects a 12-byte buffer: {6, 1, mode_flag}.
-    // mode_flag: 0 for Normal/Auto, 1 for Fast/Dust-Cleaning.
-    DWORD inBuffer[3] = { 6, 1, (mode == FanMode::Fast) ? 1UL : 0UL };
-
-    BOOL result = DeviceIoControl(
-        hDriver,
-        FanControllerImpl::IOCTL_WRITE_MODE,
-        inBuffer,
-        sizeof(inBuffer),
-        NULL,
-        0,
-        NULL,
-        NULL
-    );
-
-    CloseHandle(hDriver);
-    return result;
-}
-
-FanMode GetFanMode() {
-    HANDLE hDriver = CreateFileW(
-        FanControllerImpl::DRIVER_PATH,
-        GENERIC_READ,
-        0,
-        NULL,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL
-    );
-
-    if (hDriver == INVALID_HANDLE_VALUE) {
-        return FanMode::Unknown;
-    }
-
-    DWORD inBuffer = 14;
-    DWORD outBuffer = 0;
-    DWORD bytesReturned = 0;
-
-    BOOL result = DeviceIoControl(
-        hDriver,
-        FanControllerImpl::IOCTL_READ_STATE,
-        &inBuffer,
-        sizeof(inBuffer),
-        &outBuffer,
-        sizeof(outBuffer),
-        &bytesReturned,
-        NULL
-    );
-
-    CloseHandle(hDriver);
-
-    if (!result || bytesReturned != sizeof(outBuffer)) {
-        return FanMode::Unknown;
-    }
-
-    return (outBuffer == FanControllerImpl::DRIVER_STATE_VALUE_FOR_NORMAL) ? FanMode::Normal : FanMode::Fast;
-}
+std::unique_ptr<FanDriver> g_fanDriver;
 
 //================================================================================
-// 4. Application Logic
+// 3. Application Logic
 //================================================================================
 void RestoreNormalFanSpeedOnExit() {
+    if (!g_fanDriver) return;
+
     for (int i = 0; i < 3; ++i) {
-        if (SetFanMode(FanMode::Normal) && GetFanMode() == FanMode::Normal) {
+        if (g_fanDriver->SetMode(FanMode::Normal) && g_fanDriver->GetMode() == FanMode::Normal) {
             return;
         }
-        Sleep(250);
+        Sleep(100);
     }
-    SetFanMode(FanMode::Normal);
+    g_fanDriver->SetMode(FanMode::Normal);
 }
 
 void Cleanup() {
     if (g_hMutex) {
         ReleaseMutex(g_hMutex);
         CloseHandle(g_hMutex);
+        g_hMutex = NULL;
     }
 }
 
@@ -153,6 +152,52 @@ bool InitializeTrayIcon(HWND hWnd, NOTIFYICONDATA* nid) {
     lstrcpy(nid->szTip, L"FanControl (RMB to Exit)");
 
     return Shell_NotifyIcon(NIM_ADD, nid);
+}
+
+void ProcessFanLogic(ULONGLONG& lastActionTime)
+{
+    const DWORD FAST_MODE_RESET_INTERVAL = 8800;
+    ULONGLONG currentTime = GetTickCount64();
+    FanMode currentMode = g_fanDriver->GetMode();
+
+    if (currentMode == FanMode::Fast) {
+        if (currentTime - lastActionTime > FAST_MODE_RESET_INTERVAL) {
+            g_fanDriver->SetMode(FanMode::Normal);
+            g_fanDriver->SetMode(FanMode::Fast);
+            lastActionTime = currentTime;
+        }
+    }
+    else if (currentMode == FanMode::Normal) {
+        g_fanDriver->SetMode(FanMode::Fast);
+        lastActionTime = currentTime;
+    }
+}
+
+void RunMainLoop() {
+    const DWORD UI_LOOP_INTERVAL = 50;
+
+    g_fanDriver->SetMode(FanMode::Fast);
+    ULONGLONG lastActionTime = GetTickCount64();
+
+    bool keepRunning = true;
+    while (keepRunning) {
+        DWORD waitResult = MsgWaitForMultipleObjects(0, NULL, FALSE, UI_LOOP_INTERVAL, QS_ALLINPUT);
+
+        if (waitResult == WAIT_OBJECT_0) {
+            MSG msg;
+            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) {
+                    keepRunning = false;
+                    break;
+                }
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+            if (!keepRunning) continue;
+        }
+
+        ProcessFanLogic(lastActionTime);
+    }
 }
 
 LRESULT CALLBACK WndProc(
@@ -184,54 +229,16 @@ LRESULT CALLBACK WndProc(
     return DefWindowProc(hWnd, iMsg, wParam, lParam);
 }
 
-void ProcessFanLogic() {
-    // Periodically re-assert fast mode in case it was reset by the system.
-    if (GetFanMode() == FanMode::Normal) {
-        if (!SetFanMode(FanMode::Fast)) {
-            PostQuitMessage(1);
-        }
-    }
-}
-
-void RunMainLoop() {
-    if (!SetFanMode(FanMode::Fast)) {
-        MessageBox(NULL, L"Could not set initial fan speed. Is the driver installed?", L"Error", MB_OK | MB_ICONERROR);
-        PostQuitMessage(1);
-        return;
-    }
-
-    bool keepRunning = true;
-    while (keepRunning) {
-        DWORD waitResult = MsgWaitForMultipleObjects(
-            0,
-            NULL,
-            FALSE,
-            2000,
-            QS_ALLINPUT
-        );
-
-        if (waitResult == WAIT_OBJECT_0) {
-            MSG msg;
-            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-                if (msg.message == WM_QUIT) {
-                    keepRunning = false;
-                    break;
-                }
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-            }
-        }
-        else if (waitResult == WAIT_TIMEOUT) {
-            ProcessFanLogic();
-        }
-    }
-}
-
 bool InitializeApplication(HINSTANCE hInstance) {
     g_hMutex = CreateMutex(NULL, TRUE, APP_MUTEX_NAME);
     if (g_hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
         MessageBox(NULL, L"Another instance of FanControl is already running.", L"Error", MB_OK | MB_ICONERROR);
-        if (g_hMutex) CloseHandle(g_hMutex);
+        return false;
+    }
+
+    g_fanDriver = std::make_unique<FanDriver>();
+    if (!g_fanDriver->IsInitialized()) {
+        MessageBox(NULL, L"Could not open handle to fan driver.\nIs it installed and running correctly?", L"Error", MB_OK | MB_ICONERROR);
         return false;
     }
 
@@ -247,11 +254,18 @@ bool InitializeApplication(HINSTANCE hInstance) {
         0, 0, 0, 0, 0,
         NULL, NULL, hInstance, NULL
     );
-    return hWnd != NULL;
+    if (!hWnd) return false;
+
+    if (g_fanDriver->GetMode() == FanMode::Unknown) {
+        MessageBox(NULL, L"Could not communicate with fan driver.\nCheck permissions or driver status.", L"Error", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    return true;
 }
 
 //================================================================================
-// 5. Main Entry Point
+// 4. Main Entry Point
 //================================================================================
 int WINAPI WinMain(
     _In_ HINSTANCE hInstance,
@@ -264,6 +278,7 @@ int WINAPI WinMain(
     UNREFERENCED_PARAMETER(nCmdShow);
 
     if (!InitializeApplication(hInstance)) {
+        Cleanup();
         return 1;
     }
 
