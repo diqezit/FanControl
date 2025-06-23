@@ -125,6 +125,118 @@ This software is provided as is. Use at your own risk. No warranty is provided.
 
 Программное обеспечение предоставляется «как есть». Используйте на свой страх и риск. Гарантии не предоставляются.
 
+
+//=================================================================//
+Детальный Анализ Проведенной Работы по Исследованию Драйвера Lenovo Energy Management (AcpiVpc.sys)
+Цель исследования: Понять внутренний механизм работы драйвера AcpiVpc.sys для возможности прямого программного управления функциями оборудования, в частности, скоростью вращения вентиляторов.
+
+Проделанные этапы и ключевые выводы:
+
+#### Этап 1: Декомпозиция Установочного Пакета
+С помощью утилиты-архиватора UniExtractRC3 был вскрыт исполняемый файл установщика драйвера Lenovo Energy Management.
+Были успешно извлечены "чистые" компоненты драйвера, необходимые для его ручной установки и анализа. Ключевые полученные файлы:
+AcpiVpc.sys — исполняемый файл драйвера режима ядра.
+AcpiVpc.inf — установочный скрипт, содержащий инструкции для Windows.
+acpivpc.cat — файл каталога с цифровой подписью, подтверждающий подлинность драйвера.
+Этот этап позволил изолировать основной объект исследования (AcpiVpc.sys) от сопутствующего программного обеспечения и подготовить его для дальнейшего анализа.
+
+#### Этап 2: Статический Анализ Кода Драйвера с Помощью Ghidra
+Файл AcpiVpc.sys был загружен в инструмент для обратной разработки Ghidra. Был произведен автоматический анализ для дизассемблирования машинного кода и его декомпиляции в читаемый псевдокод на языке C.
+Результаты:
+Идентификация точки входа (DriverEntry): Была найдена основная функция драйвера, с которой начинается его выполнение. Анализ показал, что она инициирует два ключевых процесса: назначение обработчиков и инициализацию устройства.
+Анализ обработчиков IRP (I/O Request Packet): Было установлено, что драйвер регистрирует обработчики для стандартных системных запросов. Наибольший интерес представил обработчик для IRP_MJ_DEVICE_CONTROL (функция FUN_140002218), так как именно через него приложения пользовательского режима отправляют команды драйверу.
+Выявление архитектуры "прокси" (драйвера-посредника): Анализ кода обработчика IRP_MJ_DEVICE_CONTROL показал, что он не содержит логики непосредственного управления оборудованием. Вместо этого он использует системную функцию IofCallDriver, чтобы перенаправить полученный запрос (IRP) другому драйверу, находящемуся ниже в стеке устройств. Это ключевой вывод всего исследования.
+Полный анализ процедуры инициализации: Углубленный поиск по импортируемым функциям позволил найти функцию (UndefinedFunction_140012728), ответственную за полную настройку. Анализ её кода окончательно подтвердил архитектуру:
+Создание виртуального устройства: Драйвер вызывает IoCreateDevice для создания собственного объекта устройства с именем \Device\EnergyDrv.
+Присоединение к стеку: Сразу после этого он вызывает IoAttachDeviceToDeviceStack, чтобы "встроиться" в цепочку драйверов над существующим физическим устройством (PDO).
+Создание символической ссылки: В конце вызывается IoCreateSymbolicLink для создания псевдонима \\.\EnergyDrv (\DosDevices\EnergyDrv), который делает устройство доступным для приложений из пользовательского режима, таких как предоставленный C++ код.
+
+![image](https://github.com/user-attachments/assets/acb7cde5-7275-4cda-9925-5d3baf6d8054)
+
+`
+void UndefinedFunction_140012728(undefined8 param_1,ulonglong param_2)
+
+{
+  ulonglong *puVar1;
+  ulonglong *puVar2;
+  int iVar3;
+  ulonglong uVar4;
+  undefined1 auStack_e8 [32];
+  undefined4 uStack_c8;
+  undefined1 uStack_c0;
+  ulonglong *puStack_b8;
+  ulonglong uStack_a8;
+  undefined1 auStack_a0 [16];
+  undefined1 auStack_90 [16];
+  wchar_t awStack_80 [24];
+  wchar_t awStack_50 [20];
+  ulonglong uStack_28;
+  
+  uStack_28 = DAT_140004000 ^ (ulonglong)auStack_e8;
+  uStack_a8 = 0;
+  builtin_wcsncpy(awStack_50,L"\\Device\\EnergyDrv",0x12);
+  builtin_wcsncpy(awStack_80 + 0x10,L"gyDrv",6);
+  builtin_wcsncpy(awStack_80,L"\\DosDevices\\Ener",0x10);
+  if (param_2 != 0) {
+    RtlInitUnicodeString(auStack_a0,awStack_50);
+    puStack_b8 = &uStack_a8;
+    uStack_c0 = 0;
+    uStack_c8 = 0;
+    iVar3 = IoCreateDevice(param_1,0x180,auStack_a0,0x8310);
+    if (-1 < iVar3) {
+      *(undefined8 *)(uStack_a8 + 0x20) = 0;
+      puVar2 = *(ulonglong **)(uStack_a8 + 0x40);
+      FUN_1400010a0(puVar2,0,0x180);
+      uVar4 = IoAttachDeviceToDeviceStack(uStack_a8,param_2);
+      puVar2[3] = uVar4;
+      if ((((uVar4 != 0) && (iVar3 = FUN_1400110d4((longlong)puVar2), -1 < iVar3)) &&
+          (uVar4 = FUN_140011000((longlong)puVar2), -1 < (int)uVar4)) &&
+         (iVar3 = (*DAT_14000f588)(param_2,FUN_140001da4,puVar2), uVar4 = DAT_140004028, -1 < iVar 3)
+         ) {
+        LOCK();
+        DAT_140004028 = uStack_a8;
+        UNLOCK();
+        puVar2[1] = uVar4;
+        KeInitializeSpinLock(puVar2 + 0x11);
+        puVar1 = puVar2 + 0x12;
+        puVar2[0x13] = (ulonglong)puVar1;
+        *puVar1 = (ulonglong)puVar1;
+        KeInitializeMutex(puVar2 + 0x14,0);
+        uStack_c8 = 0x20;
+        IoInitializeRemoveLockEx(puVar2 + 4,0,0,800);
+        *puVar2 = uStack_a8;
+        puVar2[2] = param_2;
+        *(undefined1 *)(puVar2 + 8) = 0;
+        *(undefined4 *)(puVar2 + 9) = 5;
+        *(undefined4 *)((longlong)puVar2 + 0x4c) = 10;
+        *(undefined1 *)(puVar2 + 0x1f) = 0;
+        *(uint *)(uStack_a8 + 0x30) = *(uint *)(uStack_a8 + 0x30) | 0x2000;
+        *(uint *)(uStack_a8 + 0x30) = *(uint *)(uStack_a8 + 0x30) & 0xffffff7f;
+        RtlInitUnicodeString(auStack_90,awStack_80);
+        iVar3 = IoCreateSymbolicLink(auStack_90,auStack_a0);
+        if (-1 < iVar3) goto LAB_14001293f;
+      }
+      if (puVar2[3] != 0) {
+        IoDetachDevice();
+        puVar2[3] = 0;
+      }
+      IoDeleteDevice(uStack_a8);
+    }
+  }
+LAB_14001293f:
+  FUN_140002480(uStack_28 ^ (ulonglong)auStack_e8);
+  return;
+}
+`
+
+
+#### Этап 3: Сопоставление Результатов Анализа с Клиентским Приложением
+Результаты анализа драйвера были сопоставлены с предоставленным исходным кодом C++ приложения.
+Была установлена полная взаимосвязь между приложением и драйвером:
+Приложение использует CreateFile с путем \\.\EnergyDrv, что в точности соответствует символической ссылке, создаваемой драйвером.
+Приложение использует DeviceIoControl для отправки команд, что напрямую соответствует обработчику IRP_MJ_DEVICE_CONTROL, найденному в драйвере.
+Стало очевидно, что "магические числа" (IOCTL-коды 0x831020C0, 0x831020C4 и форматы буферов данных) не являются частью логики AcpiVpc.sys, а служат "сквозным паролем", который этот драйвер-посредник передает дальше, настоящему исполнителю.
+
 ---
 ---
 
