@@ -14,6 +14,7 @@
 constexpr WCHAR APP_WINDOW_CLASS[] = L"__FanControlHiddenWindow";
 constexpr WCHAR APP_MUTEX_NAME[] = L"Global\\FanControlSingletonMutex";
 constexpr UINT  WM_TRAY_ICON_MSG = WM_APP + 1;
+constexpr UINT_PTR TIMER_ID = 1;
 
 HANDLE g_hMutex = NULL;
 
@@ -24,7 +25,7 @@ enum class FanMode {
 };
 
 //================================================================================
-// 2. Fan Driver Abstraction Class (SRP, DRY, RAII)
+// 2. Abstraction Classes
 //================================================================================
 class FanDriver
 {
@@ -113,10 +114,51 @@ private:
     HANDLE m_hDriver;
 };
 
+class TrayIcon
+{
+public:
+    TrayIcon() { ZeroMemory(&m_nid, sizeof(m_nid)); }
+    ~TrayIcon()
+    {
+        Shell_NotifyIcon(NIM_DELETE, &m_nid);
+        if (m_nid.hIcon) {
+            DestroyIcon(m_nid.hIcon);
+        }
+    }
+
+    bool Create(HWND hWnd, HINSTANCE hInstance)
+    {
+        m_nid.cbSize = sizeof(m_nid);
+        m_nid.hWnd = hWnd;
+        m_nid.uID = 0;
+        m_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        m_nid.uCallbackMessage = WM_TRAY_ICON_MSG;
+        Update(hInstance, IDI_ICON1, L"FanControl (RMB to Exit)");
+        return Shell_NotifyIcon(NIM_ADD, &m_nid);
+    }
+
+    void Update(HINSTANCE hInstance, UINT iconId, const WCHAR* tip)
+    {
+        HICON hNewIcon = LoadIcon(hInstance, MAKEINTRESOURCE(iconId));
+        if (hNewIcon) {
+            if (m_nid.hIcon) {
+                DestroyIcon(m_nid.hIcon);
+            }
+            m_nid.hIcon = hNewIcon;
+        }
+        lstrcpy(m_nid.szTip, tip);
+        Shell_NotifyIcon(NIM_MODIFY, &m_nid);
+    }
+
+private:
+    NOTIFYICONDATA m_nid;
+};
+
 std::unique_ptr<FanDriver> g_fanDriver;
+std::unique_ptr<TrayIcon>  g_trayIcon;
 
 //================================================================================
-// 3. Application Logic
+// 3. Application Logic and Window Procedure
 //================================================================================
 void RestoreNormalFanSpeedOnExit() {
     if (!g_fanDriver) return;
@@ -138,27 +180,32 @@ void Cleanup() {
     }
 }
 
-bool InitializeTrayIcon(HWND hWnd, NOTIFYICONDATA* nid) {
-    memset(nid, 0, sizeof(*nid));
-    nid->cbSize = sizeof(*nid);
-    nid->hWnd = hWnd;
-    nid->uID = 0;
-    nid->uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    nid->uCallbackMessage = WM_TRAY_ICON_MSG;
-
-    HICON hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_ICON1));
-    nid->hIcon = (hIcon) ? hIcon : LoadIcon(nullptr, IDI_APPLICATION);
-
-    lstrcpy(nid->szTip, L"FanControl (RMB to Exit)");
-
-    return Shell_NotifyIcon(NIM_ADD, nid);
-}
-
-void ProcessFanLogic(ULONGLONG& lastActionTime)
+void ProcessFanLogic(ULONGLONG& lastActionTime, int& errorCounter, HWND hWnd)
 {
     const DWORD FAST_MODE_RESET_INTERVAL = 8800;
+    const int MAX_ERRORS = 5;
+    HINSTANCE hInstance = GetModuleHandle(NULL);
+
     ULONGLONG currentTime = GetTickCount64();
     FanMode currentMode = g_fanDriver->GetMode();
+
+    if (currentMode == FanMode::Unknown) {
+        errorCounter++;
+        if (errorCounter == 1) {
+            g_trayIcon->Update(hInstance, IDI_ICON2, L"FanControl: Driver communication error!");
+        }
+        if (errorCounter >= MAX_ERRORS) {
+            KillTimer(hWnd, TIMER_ID);
+            MessageBox(hWnd, L"Failed to communicate with the fan driver multiple times. The application will now exit.", L"Critical Error", MB_OK | MB_ICONERROR);
+            DestroyWindow(hWnd);
+        }
+        return;
+    }
+
+    if (errorCounter > 0) {
+        errorCounter = 0;
+        g_trayIcon->Update(hInstance, IDI_ICON1, L"FanControl: Max Speed Active");
+    }
 
     if (currentMode == FanMode::Fast) {
         if (currentTime - lastActionTime > FAST_MODE_RESET_INTERVAL) {
@@ -173,30 +220,24 @@ void ProcessFanLogic(ULONGLONG& lastActionTime)
     }
 }
 
-void RunMainLoop() {
-    const DWORD UI_LOOP_INTERVAL = 50;
-
+LRESULT OnCreate(HWND hWnd) {
+    g_trayIcon = std::make_unique<TrayIcon>();
+    if (!g_trayIcon->Create(hWnd, GetModuleHandle(NULL))) {
+        MessageBox(NULL, L"Could not create tray icon.", L"Error", MB_OK | MB_ICONERROR);
+        return -1;
+    }
     g_fanDriver->SetMode(FanMode::Fast);
-    ULONGLONG lastActionTime = GetTickCount64();
+    SetTimer(hWnd, TIMER_ID, 200, NULL);
+    return 0;
+}
 
-    bool keepRunning = true;
-    while (keepRunning) {
-        DWORD waitResult = MsgWaitForMultipleObjects(0, NULL, FALSE, UI_LOOP_INTERVAL, QS_ALLINPUT);
+void OnTimer(HWND hWnd, ULONGLONG& lastActionTime, int& errorCounter) {
+    ProcessFanLogic(lastActionTime, errorCounter, hWnd);
+}
 
-        if (waitResult == WAIT_OBJECT_0) {
-            MSG msg;
-            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-                if (msg.message == WM_QUIT) {
-                    keepRunning = false;
-                    break;
-                }
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-            }
-            if (!keepRunning) continue;
-        }
-
-        ProcessFanLogic(lastActionTime);
+void OnTrayIcon(HWND hWnd, LPARAM lParam) {
+    if (lParam == WM_RBUTTONUP) {
+        DestroyWindow(hWnd);
     }
 }
 
@@ -206,23 +247,23 @@ LRESULT CALLBACK WndProc(
     WPARAM wParam,
     LPARAM lParam
 ) {
-    static NOTIFYICONDATA nid;
+    static ULONGLONG lastActionTime = 0;
+    static int errorCounter = 0;
 
     switch (iMsg) {
     case WM_CREATE:
-        if (!InitializeTrayIcon(hWnd, &nid)) {
-            MessageBox(NULL, L"Could not create tray icon.", L"Error", MB_OK | MB_ICONERROR);
-            PostQuitMessage(1);
+        return OnCreate(hWnd);
+    case WM_TIMER:
+        if (wParam == TIMER_ID) {
+            OnTimer(hWnd, lastActionTime, errorCounter);
         }
         return 0;
     case WM_TRAY_ICON_MSG:
-        if (lParam == WM_RBUTTONUP) {
-            PostQuitMessage(0);
-        }
+        OnTrayIcon(hWnd, lParam);
         return 0;
     case WM_DESTROY:
-        Shell_NotifyIcon(NIM_DELETE, &nid);
-        if (nid.hIcon) DestroyIcon(nid.hIcon);
+        KillTimer(hWnd, TIMER_ID);
+        g_trayIcon.reset();
         PostQuitMessage(0);
         return 0;
     }
@@ -247,14 +288,6 @@ bool InitializeApplication(HINSTANCE hInstance) {
     wc.lpfnWndProc = WndProc;
     wc.lpszClassName = APP_WINDOW_CLASS;
     if (!RegisterClass(&wc)) return false;
-
-    HWND hWnd = CreateWindow(
-        APP_WINDOW_CLASS,
-        L"FanControl Hidden Window",
-        0, 0, 0, 0, 0,
-        NULL, NULL, hInstance, NULL
-    );
-    if (!hWnd) return false;
 
     if (g_fanDriver->GetMode() == FanMode::Unknown) {
         MessageBox(NULL, L"Could not communicate with fan driver.\nCheck permissions or driver status.", L"Error", MB_OK | MB_ICONERROR);
@@ -282,13 +315,26 @@ int WINAPI WinMain(
         return 1;
     }
 
-    __try {
-        RunMainLoop();
-    }
-    __finally {
-        RestoreNormalFanSpeedOnExit();
+    HWND hWnd = CreateWindow(
+        APP_WINDOW_CLASS,
+        L"FanControl Hidden Window",
+        0, 0, 0, 0, 0,
+        NULL, NULL, hInstance, NULL
+    );
+
+    if (!hWnd) {
         Cleanup();
+        return 1;
     }
 
-    return 0;
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    RestoreNormalFanSpeedOnExit();
+    Cleanup();
+
+    return static_cast<int>(msg.wParam);
 }

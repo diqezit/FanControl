@@ -9,9 +9,8 @@
       <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
       <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
     </Filter>
-    <Filter Include="Resource Files">
-      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
-      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    <Filter Include="Res">
+      <UniqueIdentifier>{e331bbf9-ee7b-4c23-8575-3179f2cf53d9}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
@@ -25,13 +24,14 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="FanControl.rc">
-      <Filter>Resource Files</Filter>
-    </ResourceCompile>
+    <ResourceCompile Include="FanControl.rc" />
   </ItemGroup>
   <ItemGroup>
-    <Image Include="..\..\..\..\Downloads\app_icon.ico">
-      <Filter>Resource Files</Filter>
+    <Image Include="app_icon.ico">
+      <Filter>Res</Filter>
+    </Image>
+    <Image Include="app_icon_error.ico">
+      <Filter>Res</Filter>
     </Image>
   </ItemGroup>
 </Project>
